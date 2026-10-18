@@ -30,3 +30,5 @@ include(":app")
 include(":core")
 include(":data")
 include(":backend")
+include(":ai")
+

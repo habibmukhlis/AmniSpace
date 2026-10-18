@@ -43,6 +43,31 @@ class UserRepository @Inject constructor(
     var currentStreakState = MutableStateFlow(userInfo.streak.currentStreak)
 
     var activeBoostsState = MutableStateFlow(userInfo.active_boosts)
+    var distractionAdderPriceState = MutableStateFlow(getDistractionAdderPrice())
+    var distractionRemoverPriceState = MutableStateFlow(getDistractionRemoverPrice())
+    var inventoryState = MutableStateFlow<Map<InventoryItem, Int>>(userInfo.inventory.toMap())
+
+    fun getDistractionAdderPrice(): Int {
+        return userInfo.customization_info.distractionAdderPrice.coerceIn(0, 10)
+    }
+
+    fun getDistractionRemoverPrice(): Int {
+        return userInfo.customization_info.distractionRemoverPrice.coerceIn(20, 500)
+    }
+
+    fun getEffectivePrice(item: InventoryItem): Int {
+        return when (item) {
+            InventoryItem.DISTRACTION_ADDER -> getDistractionAdderPrice()
+            InventoryItem.DISTRACTION_REMOVER -> getDistractionRemoverPrice()
+            else -> item.price
+        }
+    }
+
+    fun updateDistractionToolPrices(adderPrice: Int, removerPrice: Int) {
+        userInfo.customization_info.distractionAdderPrice = adderPrice.coerceIn(0, 10)
+        userInfo.customization_info.distractionRemoverPrice = removerPrice.coerceIn(20, 500)
+        saveUserInfo()
+    }
     
     // the below variables act as a trigger for launching the reward dialog declared in the MainActivity from a
     // different SubScreen.
@@ -107,6 +132,9 @@ class UserRepository @Inject constructor(
         context.getSharedPreferences("user_info", Context.MODE_PRIVATE)
             .edit { putString("user_info", json.encodeToString(userInfo)) }
         coinsState.value = userInfo.coins
+        distractionAdderPriceState.value = getDistractionAdderPrice()
+        distractionRemoverPriceState.value = getDistractionRemoverPrice()
+        inventoryState.value = userInfo.inventory.toMap()
     }
 
     fun getInventoryItemCount(item: InventoryItem): Int {
@@ -123,10 +151,13 @@ class UserRepository @Inject constructor(
         saveUserInfo()
     }
     fun deductFromInventory(item: InventoryItem, count: Int = 1) {
-        if (getInventoryItemCount(item) > 0) {
-            userInfo.inventory[item] = getInventoryItemCount(item) - count
-            if (getInventoryItemCount(item) == 0) {
+        val current = getInventoryItemCount(item)
+        if (current > 0) {
+            val remaining = (current - count).coerceAtLeast(0)
+            if (remaining == 0) {
                 userInfo.inventory.remove(item)
+            } else {
+                userInfo.inventory[item] = remaining
             }
             saveUserInfo()
         }
@@ -139,14 +170,12 @@ class UserRepository @Inject constructor(
     }
 
     fun useCoins(number: Int) {
-        userInfo.coins -= number
-        coinsState.value -= number
+        userInfo.coins = (userInfo.coins - number).coerceAtLeast(0)
         saveUserInfo()
     }
 
     fun addCoins(addedCoins: Int) {
         userInfo.coins += addedCoins
-        coinsState.value+=addedCoins
         saveUserInfo()
     }
 

@@ -10,6 +10,8 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Process
 import android.provider.Settings
+import android.util.Log
+import android.widget.Toast
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -31,28 +33,39 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.DateRange
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -63,17 +76,30 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import androidx.core.content.edit
 import androidx.core.graphics.drawable.toBitmap
+import androidx.navigation.NavController
+import dagger.hilt.android.EntryPointAccessors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import neth.iecal.questphone.R
+import neth.iecal.questphone.app.screens.quest.setup.deep_focus.SelectAppsDialog
+import neth.iecal.questphone.backed.repositories.UserRepositoryEntryPoint
+import neth.iecal.questphone.core.services.AppBlockerService
+import neth.iecal.questphone.core.services.AppBlockerServiceInfo
+import neth.iecal.questphone.core.services.INTENT_ACTION_REFRESH_APP_BLOCKER
 import neth.iecal.questphone.core.utils.UsageStatsHelper
+import nethical.questphone.core.core.utils.managers.sendRefreshRequest
 import nethical.questphone.data.ScreentimeStat
+import nethical.questphone.data.game.InventoryItem
 import java.text.SimpleDateFormat
 import java.time.Instant
 import java.time.LocalDate
@@ -84,29 +110,104 @@ import java.util.concurrent.TimeUnit
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ScreentimeStatsScreen() {
+fun ScreentimeStatsScreen(navController: NavController? = null) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
+    val userRepository = remember(context) {
+        EntryPointAccessors.fromApplication(
+            context.applicationContext,
+            UserRepositoryEntryPoint::class.java
+        ).userRepository()
+    }
+
+    val userCoins by userRepository.coinsState.collectAsState()
+    val adderPrice by userRepository.distractionAdderPriceState.collectAsState()
+    val removerPrice by userRepository.distractionRemoverPriceState.collectAsState()
+    val inventoryMap by userRepository.inventoryState.collectAsState()
+    val adderOwned = inventoryMap[InventoryItem.DISTRACTION_ADDER] ?: 0
+    val removerOwned = inventoryMap[InventoryItem.DISTRACTION_REMOVER] ?: 0
+
     var usageStats by remember { mutableStateOf<List<ScreentimeStat>>(emptyList()) }
     var totalUsage by remember { mutableStateOf("0m") }
-    var selectedDate by remember { mutableStateOf(System.currentTimeMillis()) }
-    var currentDate by remember { mutableStateOf(System.currentTimeMillis()) }
-    var earliestDate by remember { mutableStateOf(System.currentTimeMillis()) }
+    var selectedDate by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    var currentDate by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    var earliestDate by remember { mutableLongStateOf(System.currentTimeMillis()) }
     var showMenu by remember { mutableStateOf(false) }
     var showPermissionDialog by remember { mutableStateOf(false) }
-    var ignoredPackages by remember { mutableStateOf(mutableSetOf<String>()) }
+    var showDistractingAppsDialog by remember { mutableStateOf(false) }
+    var showIgnoredAppsDialog by remember { mutableStateOf(false) }
+    var showToolPricingDialog by remember { mutableStateOf(false) }
+    var pendingDistractionAction by remember { mutableStateOf<PendingDistractionAction?>(null) }
+    var ignoredPackages by remember { mutableStateOf(setOf<String>()) }
+    var blockedPackages by remember { mutableStateOf(userRepository.getBlockedPackages()) }
     var isLoading by remember { mutableStateOf(true) }
 
-    val prefs = remember { context.getSharedPreferences("digipaws_prefs", Context.MODE_PRIVATE) }
+    // Currently selected app for detailed Per-App Usage Breakdown
+    var selectedAppStat by remember { mutableStateOf<ScreentimeStat?>(null) }
 
-    // Load usage stats
+    val prefs = remember { context.getSharedPreferences("digipaws_prefs", Context.MODE_PRIVATE) }
+    val distractionsPrefs = remember { context.getSharedPreferences("distractions", Context.MODE_PRIVATE) }
+
+    fun syncBlockedApps(updated: Set<String>) {
+        blockedPackages = updated
+        userRepository.updateBlockedAppsSet(updated)
+        distractionsPrefs.edit { putStringSet("distracting_apps", updated) }
+        sendRefreshRequest(context, INTENT_ACTION_REFRESH_APP_BLOCKER)
+        AppBlockerServiceInfo.appBlockerService?.loadLockedApps()
+        if (!AppBlockerServiceInfo.isUsingAccessibilityService && AppBlockerServiceInfo.appBlockerService == null && updated.isNotEmpty()) {
+            try {
+                ContextCompat.startForegroundService(context, Intent(context, AppBlockerService::class.java))
+            } catch (e: Exception) {
+                Log.e("ScreentimeStatsScreen", "Failed to start AppBlockerService: ${e.message}")
+            }
+        }
+    }
+
+    fun applyImmediateToggle(packageName: String) {
+        val updated = blockedPackages.toMutableSet().apply {
+            if (contains(packageName)) remove(packageName) else add(packageName)
+        }
+        syncBlockedApps(updated)
+    }
+
+    fun requestToggleBlockedPackage(packageName: String, appLabel: String = packageName) {
+        val isCurrentlyBlocked = blockedPackages.contains(packageName)
+        if (!isCurrentlyBlocked) {
+            // Adding to Distracting Apps / Blocklist
+            if (adderPrice <= 0) {
+                applyImmediateToggle(packageName)
+                Toast.makeText(
+                    context,
+                    "Added $appLabel to Distracting Apps (Free)",
+                    Toast.LENGTH_SHORT
+                ).show()
+            } else {
+                pendingDistractionAction = PendingDistractionAction.SingleToggle(
+                    packageName = packageName,
+                    appLabel = appLabel,
+                    isAdding = true
+                )
+            }
+        } else {
+            // Removing from Distracting Apps / Blocklist always requires Distraction Remover (20..500)
+            pendingDistractionAction = PendingDistractionAction.SingleToggle(
+                packageName = packageName,
+                appLabel = appLabel,
+                isAdding = false
+            )
+        }
+    }
+
     fun loadUsageStats(date: LocalDate = LocalDate.now()) {
         scope.launch(Dispatchers.IO) {
             isLoading = true
             val usageStatsHelper = UsageStatsHelper(context)
+            val launcherPkg = getDefaultLauncherPackage(context.packageManager)
             val list = usageStatsHelper.getForegroundStatsByDay(date).filter {
-                it.totalTime >= 180_000 && it.packageName !in ignoredPackages
+                it.totalTime >= 1_000L &&
+                    it.packageName != launcherPkg &&
+                    it.packageName !in ignoredPackages
             }
             val total = list.sumOf { it.totalTime }
 
@@ -118,13 +219,25 @@ fun ScreentimeStatsScreen() {
         }
     }
 
-    // Find data range
+    fun toggleIgnoredPackage(packageName: String) {
+        val updated = ignoredPackages.toMutableSet().apply {
+            if (contains(packageName)) remove(packageName) else add(packageName)
+        }
+        ignoredPackages = updated
+        saveIgnoredPackages(prefs, updated)
+        val localDate = Instant.ofEpochMilli(selectedDate)
+            .atZone(ZoneId.systemDefault())
+            .toLocalDate()
+        loadUsageStats(localDate)
+    }
+
     fun findDataRange() {
         scope.launch(Dispatchers.IO) {
             val usageStatsManager = context.getSystemService(UsageStatsManager::class.java)
             val stats = usageStatsManager.queryUsageStats(
                 UsageStatsManager.INTERVAL_DAILY,
-                0, System.currentTimeMillis()
+                0,
+                System.currentTimeMillis()
             )
             earliestDate = stats.minOfOrNull { it.firstTimeStamp } ?: System.currentTimeMillis()
             currentDate = System.currentTimeMillis()
@@ -132,24 +245,76 @@ fun ScreentimeStatsScreen() {
         }
     }
 
-    // Initialize
     LaunchedEffect(Unit) {
         if (!hasUsageStatsPermission(context)) {
             showPermissionDialog = true
         }
 
         withContext(Dispatchers.IO) {
-            getDefaultLauncherPackage(context.packageManager)?.let {
-                ignoredPackages.add(it)
-            }
-            ignoredPackages.addAll(loadIgnoredPackages(prefs))
+            ignoredPackages = loadIgnoredPackages(prefs)
+            blockedPackages = userRepository.getBlockedPackages()
         }
 
         loadUsageStats()
         findDataRange()
     }
 
-    // Permission Dialog
+    // Render gated tool modal above both Screentime overview and Per-App Usage Breakdown
+    pendingDistractionAction?.let { action ->
+        DistractionToolGateDialog(
+            action = action,
+            userRepository = userRepository,
+            userCoins = userCoins,
+            adderPrice = adderPrice,
+            removerPrice = removerPrice,
+            adderOwned = adderOwned,
+            removerOwned = removerOwned,
+            onDismiss = { pendingDistractionAction = null },
+            onActionApproved = { feedbackMessage ->
+                when (action) {
+                    is PendingDistractionAction.SingleToggle -> {
+                        applyImmediateToggle(action.packageName)
+                    }
+                    is PendingDistractionAction.BulkUpdate -> {
+                        syncBlockedApps(action.targetBlockedSet)
+                    }
+                }
+                pendingDistractionAction = null
+                Toast.makeText(context, feedbackMessage, Toast.LENGTH_SHORT).show()
+            }
+        )
+    }
+
+    if (showToolPricingDialog) {
+        DistractionToolPricingSettingsDialog(
+            userRepository = userRepository,
+            currentAdderPrice = adderPrice,
+            currentRemoverPrice = removerPrice,
+            userCoins = userCoins,
+            removerOwned = removerOwned,
+            onDismiss = { showToolPricingDialog = false }
+        )
+    }
+
+    // If an app is selected, display the Per-App Usage Breakdown screen
+    val activeAppStat = selectedAppStat
+    if (activeAppStat != null) {
+        AppUsageBreakdownScreen(
+            stat = activeAppStat,
+            selectedDateMillis = selectedDate,
+            isBlocked = blockedPackages.contains(activeAppStat.packageName),
+            isIgnored = ignoredPackages.contains(activeAppStat.packageName),
+            adderPrice = adderPrice,
+            removerPrice = removerPrice,
+            adderOwned = adderOwned,
+            removerOwned = removerOwned,
+            onToggleBlocked = { pkg, label -> requestToggleBlockedPackage(pkg, label) },
+            onToggleIgnored = { pkg -> toggleIgnoredPackage(pkg) },
+            onBack = { selectedAppStat = null }
+        )
+        return
+    }
+
     if (showPermissionDialog) {
         PermissionDialog(
             onDismiss = { showPermissionDialog = false },
@@ -160,11 +325,81 @@ fun ScreentimeStatsScreen() {
         )
     }
 
+    if (showDistractingAppsDialog) {
+        val tempSelected = remember(blockedPackages) {
+            mutableStateListOf<String>().apply { addAll(blockedPackages) }
+        }
+        SelectAppsDialog(
+            selectedApps = tempSelected,
+            onDismiss = { showDistractingAppsDialog = false },
+            onConfirm = {
+                val targetSet = tempSelected.toSet()
+                val addedApps = targetSet - blockedPackages
+                val removedApps = blockedPackages - targetSet
+                showDistractingAppsDialog = false
+
+                if (addedApps.isEmpty() && removedApps.isEmpty()) {
+                    return@SelectAppsDialog
+                }
+
+                val requiresGate = removedApps.isNotEmpty() || (addedApps.isNotEmpty() && adderPrice > 0)
+                if (!requiresGate) {
+                    syncBlockedApps(targetSet)
+                    Toast.makeText(
+                        context,
+                        "Added ${addedApps.size} app(s) to Distracting Apps (Free)",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                } else {
+                    pendingDistractionAction = PendingDistractionAction.BulkUpdate(
+                        targetBlockedSet = targetSet,
+                        addedCount = addedApps.size,
+                        removedCount = removedApps.size
+                    )
+                }
+            }
+        )
+    }
+
+    if (showIgnoredAppsDialog) {
+        val tempIgnored = remember(ignoredPackages) {
+            mutableStateListOf<String>().apply { addAll(ignoredPackages) }
+        }
+        SelectAppsDialog(
+            selectedApps = tempIgnored,
+            onDismiss = { showIgnoredAppsDialog = false },
+            onConfirm = {
+                ignoredPackages = tempIgnored.toSet()
+                saveIgnoredPackages(prefs, ignoredPackages)
+                val localDate = Instant.ofEpochMilli(selectedDate)
+                    .atZone(ZoneId.systemDefault())
+                    .toLocalDate()
+                loadUsageStats(localDate)
+            }
+        )
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("App Usage", fontWeight = FontWeight.SemiBold) },
+                title = { Text("App Usage & Blocklist", fontWeight = FontWeight.SemiBold) },
+                navigationIcon = {
+                    if (navController != null) {
+                        IconButton(onClick = { navController.popBackStack() }) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        }
+                    }
+                },
                 actions = {
+                    IconButton(
+                        onClick = { showDistractingAppsDialog = true },
+                        modifier = Modifier.testTag("manage_distracting_apps_top_button")
+                    ) {
+                        Icon(
+                            painter = painterResource(R.drawable.outline_lock_24),
+                            contentDescription = "Manage Distracting Apps"
+                        )
+                    }
                     IconButton(onClick = { showMenu = true }) {
                         Icon(Icons.Default.MoreVert, "Menu")
                     }
@@ -173,12 +408,36 @@ fun ScreentimeStatsScreen() {
                         onDismissRequest = { showMenu = false }
                     ) {
                         DropdownMenuItem(
+                            text = { Text("Manage Distracting Apps") },
+                            onClick = {
+                                showMenu = false
+                                showDistractingAppsDialog = true
+                            },
+                            leadingIcon = {
+                                Icon(painter = painterResource(R.drawable.outline_lock_24), null)
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = {
+                                Text("Tool Pricing (Add: $adderPrice • Remove: $removerPrice)")
+                            },
+                            onClick = {
+                                showMenu = false
+                                showToolPricingDialog = true
+                            },
+                            leadingIcon = {
+                                Icon(Icons.Default.Settings, null)
+                            }
+                        )
+                        DropdownMenuItem(
                             text = { Text("Ignored Apps") },
                             onClick = {
                                 showMenu = false
-                                // Launch SelectAppsActivity
+                                showIgnoredAppsDialog = true
                             },
-                            leadingIcon = { Icon(painter = painterResource(neth.iecal.questphone.R.drawable.outline_lock_24), null) }
+                            leadingIcon = {
+                                Icon(Icons.Default.Settings, null)
+                            }
                         )
                     }
                 },
@@ -193,7 +452,6 @@ fun ScreentimeStatsScreen() {
                 .fillMaxSize()
                 .padding(padding)
         ) {
-            // Apps List
             if (isLoading) {
                 Box(
                     modifier = Modifier
@@ -203,30 +461,15 @@ fun ScreentimeStatsScreen() {
                 ) {
                     CircularProgressIndicator()
                 }
-            } else if (usageStats.isEmpty()) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(32.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        "No usage data available",
-                        style = MaterialTheme.typography.bodyLarge,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
             } else {
-                val context = LocalContext.current
                 val pm = context.packageManager
 
                 LazyColumn(
                     modifier = Modifier.fillMaxSize(),
                     contentPadding = PaddingValues(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    item{
-                        // Header Card with Total Usage
+                    item {
                         TotalUsageCard(
                             totalUsage = totalUsage,
                             selectedDate = selectedDate,
@@ -241,52 +484,257 @@ fun ScreentimeStatsScreen() {
                             }
                         )
                     }
-                    // Top 3 Apps Visualization
-                    if (usageStats.isNotEmpty()) {
-                        item {
-                            TopAppsSection(usageStats = usageStats.take(3))
-                        }
-                    }
-                    items(usageStats, key = { it.packageName }) { stat ->
-                        val appInfo = pm.getApplicationInfo(stat.packageName, 0)
-                        val icon = appInfo.loadIcon(pm).toBitmap().asImageBitmap()
 
+                    // Distracting Apps / Blocklist & Commitment Pricing Banner Card
+                    item {
                         Card(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clickable { },
+                                .clickable { showDistractingAppsDialog = true }
+                                .testTag("manage_blocklist_banner_card"),
+                            colors = CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f)
+                            )
                         ) {
-                            Row(
+                            Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .padding(16.dp),
-                                verticalAlignment = Alignment.CenterVertically
+                                verticalArrangement = Arrangement.spacedBy(10.dp)
                             ) {
-                                Image(
-                                    bitmap = icon,
-                                    contentDescription = null,
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(42.dp)
+                                            .clip(CircleShape)
+                                            .background(MaterialTheme.colorScheme.primary),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Lock,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.onPrimary,
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.width(14.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "Distracting Apps Blocklist (${blockedPackages.size} blocked)",
+                                            style = MaterialTheme.typography.titleSmall,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                        Text(
+                                            text = buildString {
+                                                append("Add cost: ")
+                                                append(if (adderPrice == 0) "Free (0)" else "$adderPrice coins")
+                                                append(" • Remove cost: $removerPrice coins")
+                                            },
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.85f)
+                                        )
+                                    }
+                                }
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    FilledTonalButton(
+                                        onClick = { showDistractingAppsDialog = true },
+                                        modifier = Modifier.weight(1f),
+                                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                                    ) {
+                                        Text("Edit Blocklist", style = MaterialTheme.typography.labelMedium)
+                                    }
+                                    OutlinedButton(
+                                        onClick = { showToolPricingDialog = true },
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .testTag("open_tool_pricing_settings_button"),
+                                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                                    ) {
+                                        Text("Tool Prices", style = MaterialTheme.typography.labelMedium)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (usageStats.isEmpty()) {
+                        item {
+                            Card(modifier = Modifier.fillMaxWidth()) {
+                                Box(
                                     modifier = Modifier
-                                        .size(48.dp)
-                                        .clip(RoundedCornerShape(12.dp))
-                                )
-
-                                Spacer(modifier = Modifier.width(16.dp))
-
-                                Column(modifier = Modifier.weight(1f)) {
+                                        .fillMaxWidth()
+                                        .padding(32.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
                                     Text(
-                                        appInfo.loadLabel(pm).toString(),
+                                        "No usage data available for this date",
                                         style = MaterialTheme.typography.bodyLarge,
-                                        fontWeight = FontWeight.Medium,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-
-                                    Spacer(modifier = Modifier.height(4.dp))
-
-                                    Text(
-                                        formatTime(stat.totalTime),
-                                        style = MaterialTheme.typography.bodyMedium,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
+                    } else {
+                        // Top 3 Most Used Apps Section (each card is selectable/clickable)
+                        item {
+                            TopAppsSection(
+                                usageStats = usageStats.take(3),
+                                blockedPackages = blockedPackages,
+                                onAppClick = { stat -> selectedAppStat = stat },
+                                onToggleBlock = { pkg, appLabel ->
+                                    requestToggleBlockedPackage(pkg, appLabel)
+                                }
+                            )
+                        }
+
+                        item {
+                            Text(
+                                text = "All Used Apps Today",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.padding(top = 4.dp)
+                            )
+                        }
+
+                        items(usageStats, key = { it.packageName }) { stat ->
+                            val appInfo = remember(stat.packageName) {
+                                try {
+                                    pm.getApplicationInfo(stat.packageName, 0)
+                                } catch (_: Exception) {
+                                    null
+                                }
+                            }
+                            val appLabel = remember(stat.packageName) {
+                                appInfo?.loadLabel(pm)?.toString() ?: stat.packageName
+                            }
+                            val iconBitmap = remember(stat.packageName) {
+                                try {
+                                    appInfo?.loadIcon(pm)?.toBitmap()?.asImageBitmap()
+                                } catch (_: Exception) {
+                                    null
+                                }
+                            }
+                            val isBlocked = blockedPackages.contains(stat.packageName)
+
+                            Card(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { selectedAppStat = stat }
+                                    .testTag("usage_app_card_${stat.packageName}"),
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(14.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    if (iconBitmap != null) {
+                                        Image(
+                                            bitmap = iconBitmap,
+                                            contentDescription = appLabel,
+                                            modifier = Modifier
+                                                .size(48.dp)
+                                                .clip(RoundedCornerShape(12.dp))
+                                        )
+                                    } else {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(48.dp)
+                                                .clip(RoundedCornerShape(12.dp))
+                                                .background(MaterialTheme.colorScheme.primaryContainer),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Text(
+                                                text = appLabel.take(1).uppercase(),
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        }
+                                    }
+
+                                    Spacer(modifier = Modifier.width(14.dp))
+
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = appLabel,
+                                            style = MaterialTheme.typography.bodyLarge,
+                                            fontWeight = FontWeight.Medium,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+
+                                        Spacer(modifier = Modifier.height(2.dp))
+
+                                        Text(
+                                            text = "${formatTime(stat.totalTime)} • ${maxOf(1, stat.startTimes.size)} opens",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+
+                                    Spacer(modifier = Modifier.width(8.dp))
+
+                                    // Synchronized Block / Unblock Button right on the card
+                                    Surface(
+                                        shape = RoundedCornerShape(50),
+                                        color = if (isBlocked) {
+                                            MaterialTheme.colorScheme.errorContainer
+                                        } else {
+                                            MaterialTheme.colorScheme.primaryContainer
+                                        },
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(50))
+                                            .clickable {
+                                                requestToggleBlockedPackage(stat.packageName, appLabel)
+                                            }
+                                            .testTag("quick_block_${stat.packageName}")
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Icon(
+                                                imageVector = if (isBlocked) Icons.Default.Check else Icons.Default.Add,
+                                                contentDescription = if (isBlocked) "Blocked" else "Add to Blocklist",
+                                                modifier = Modifier.size(14.dp),
+                                                tint = if (isBlocked) {
+                                                    MaterialTheme.colorScheme.onErrorContainer
+                                                } else {
+                                                    MaterialTheme.colorScheme.onPrimaryContainer
+                                                }
+                                            )
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            Text(
+                                                text = if (isBlocked) {
+                                                    "Blocked"
+                                                } else if (adderPrice == 0) {
+                                                    "Block"
+                                                } else {
+                                                    "Block ($adderPrice)"
+                                                },
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontWeight = FontWeight.SemiBold,
+                                                color = if (isBlocked) {
+                                                    MaterialTheme.colorScheme.onErrorContainer
+                                                } else {
+                                                    MaterialTheme.colorScheme.onPrimaryContainer
+                                                }
+                                            )
+                                        }
+                                    }
+
+                                    Spacer(modifier = Modifier.width(4.dp))
+
+                                    Icon(
+                                        imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                        contentDescription = "View Usage Breakdown",
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
                                 }
                             }
@@ -304,10 +752,7 @@ fun TotalUsageCard(
     selectedDate: Long,
     onDateClick: () -> Unit
 ) {
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-    ) {
+    Card(modifier = Modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -350,116 +795,182 @@ fun TotalUsageCard(
 }
 
 @Composable
-fun TopAppsSection(usageStats: List<ScreentimeStat>) {
+fun TopAppsSection(
+    usageStats: List<ScreentimeStat>,
+    blockedPackages: Set<String> = emptySet(),
+    onAppClick: (ScreentimeStat) -> Unit = {},
+    onToggleBlock: (String, String) -> Unit = { _, _ -> }
+) {
     val context = LocalContext.current
     val pm = context.packageManager
 
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-
-    ) {
+    Card(modifier = Modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(16.dp)
         ) {
-            Text(
-                "Most Used",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold,
-                modifier = Modifier.padding(bottom = 12.dp)
-            )
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 12.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    "Most Used Today",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    "Tap card for breakdown",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
 
-            val maxTime = usageStats.maxOfOrNull { it.totalTime } ?: 1L
+            val maxTime = (usageStats.maxOfOrNull { it.totalTime } ?: 1L).coerceAtLeast(1L)
 
             usageStats.forEachIndexed { index, stat ->
-                val appInfo = pm.getApplicationInfo(stat.packageName, 0)
-                val icon = appInfo.loadIcon(pm).toBitmap().asImageBitmap()
-                val percentage = (stat.totalTime.toFloat() / maxTime.toFloat())
+                val appInfo = remember(stat.packageName) {
+                    try {
+                        pm.getApplicationInfo(stat.packageName, 0)
+                    } catch (_: Exception) {
+                        null
+                    }
+                }
+                val appLabel = remember(stat.packageName) {
+                    appInfo?.loadLabel(pm)?.toString() ?: stat.packageName
+                }
+                val iconBitmap = remember(stat.packageName) {
+                    try {
+                        appInfo?.loadIcon(pm)?.toBitmap()?.asImageBitmap()
+                    } catch (_: Exception) {
+                        null
+                    }
+                }
+                val percentage = (stat.totalTime.toFloat() / maxTime.toFloat()).coerceIn(0f, 1f)
+                val isBlocked = blockedPackages.contains(stat.packageName)
 
-                Row(
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.65f),
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                        .padding(vertical = 4.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable { onAppClick(stat) }
+                        .testTag("most_used_card_${stat.packageName}")
                 ) {
-                    // Rank Badge
-                    Box(
+                    Row(
                         modifier = Modifier
-                            .size(28.dp)
-                            .clip(CircleShape)
-                            .background(
-                                when (index) {
-                                    0 -> Color(0xFFFFD700) // Gold
-                                    1 -> Color(0xFFC0C0C0) // Silver
-                                    else -> Color(0xFFCD7F32) // Bronze
-                                }
-                            ),
-                        contentAlignment = Alignment.Center
+                            .fillMaxWidth()
+                            .padding(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(
-                            "${index + 1}",
-                            color = Color.White,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 14.sp
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.width(12.dp))
-
-                    Image(
-                        bitmap = icon,
-                        contentDescription = null,
-                        modifier = Modifier
-                            .size(40.dp)
-                            .clip(RoundedCornerShape(8.dp))
-                    )
-
-                    Spacer(modifier = Modifier.width(12.dp))
-
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            appInfo.loadLabel(pm).toString(),
-                            style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = FontWeight.Medium,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-
-                        Spacer(modifier = Modifier.height(4.dp))
-
-                        // Progress bar
                         Box(
                             modifier = Modifier
-                                .fillMaxWidth()
-                                .height(6.dp)
-                                .clip(RoundedCornerShape(3.dp))
-                                .background(MaterialTheme.colorScheme.surfaceVariant)
+                                .size(26.dp)
+                                .clip(CircleShape)
+                                .background(
+                                    when (index) {
+                                        0 -> Color(0xFFFFD700)
+                                        1 -> Color(0xFFC0C0C0)
+                                        else -> Color(0xFFCD7F32)
+                                    }
+                                ),
+                            contentAlignment = Alignment.Center
                         ) {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxHeight()
-                                    .fillMaxWidth(percentage)
-                                    .background(
-                                        when (index) {
-                                            0 -> Color(0xFF2196F3)
-                                            1 -> Color(0xFFF44336)
-                                            else -> Color(0xFF4CAF50)
-                                        }
-                                    )
+                            Text(
+                                "${index + 1}",
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp
                             )
                         }
+
+                        Spacer(modifier = Modifier.width(10.dp))
+
+                        if (iconBitmap != null) {
+                            Image(
+                                bitmap = iconBitmap,
+                                contentDescription = appLabel,
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.width(10.dp))
+
+                        Column(modifier = Modifier.weight(1f)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = appLabel,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = formatTime(stat.totalTime),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.height(6.dp))
+
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(6.dp)
+                                    .clip(RoundedCornerShape(3.dp))
+                                    .background(MaterialTheme.colorScheme.surfaceVariant)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxHeight()
+                                        .fillMaxWidth(percentage)
+                                        .background(
+                                            when (index) {
+                                                0 -> Color(0xFF2196F3)
+                                                1 -> Color(0xFFF44336)
+                                                else -> Color(0xFF4CAF50)
+                                            }
+                                        )
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.width(8.dp))
+
+                        IconButton(
+                            onClick = { onToggleBlock(stat.packageName, appLabel) },
+                            modifier = Modifier.size(34.dp)
+                        ) {
+                            Icon(
+                                imageVector = if (isBlocked) Icons.Default.Lock else Icons.Default.Add,
+                                contentDescription = if (isBlocked) "Blocked" else "Add to Blocklist",
+                                tint = if (isBlocked) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                            contentDescription = "Details",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(18.dp)
+                        )
                     }
-
-                    Spacer(modifier = Modifier.width(12.dp))
-
-                    Text(
-                        formatTime(stat.totalTime),
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        color = MaterialTheme.colorScheme.primary
-                    )
                 }
             }
         }
@@ -474,7 +985,7 @@ fun PermissionDialog(onDismiss: () -> Unit, onAccept: () -> Unit) {
         title = { Text("Enable Device Usage Access") },
         text = {
             Text(
-                "DigiPaws requires device usage access to monitor apps, helping you manage screen time effectively. All data stays securely on your device."
+                "QuestPhone requires device usage access to monitor apps, helping you manage screen time effectively. All data stays securely on your device."
             )
         },
         confirmButton = {
@@ -489,8 +1000,6 @@ fun PermissionDialog(onDismiss: () -> Unit, onAccept: () -> Unit) {
         }
     )
 }
-
-// Utility Functions
 
 fun formatTime(millis: Long): String {
     val hours = TimeUnit.MILLISECONDS.toHours(millis)

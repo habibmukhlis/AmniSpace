@@ -96,22 +96,26 @@ class MainActivity : FragmentActivity() {
         val notificationScheduler = NotificationScheduler(applicationContext,questRepository)
         val modelSp = getSharedPreferences("models", Context.MODE_PRIVATE)
 
-        val isTokenizerDownloaded = modelSp.getBoolean("is_downloaded_tokenizer",false)
+        val isTokenizerDownloaded = modelSp.getBoolean("is_downloaded_tokenizer", false)
         val tokenizer = File(filesDir, "tokenizer.model")
 
-        if(!isTokenizerDownloaded || !tokenizer.exists()){
+        if (!isTokenizerDownloaded || !tokenizer.exists() || tokenizer.length() <= 1024L) {
             val inputData = Data.Builder()
                 .putString(FileDownloadWorker.KEY_URL, "https://huggingface.co/onnx-community/siglip2-base-patch16-224-ONNX/resolve/main/tokenizer.model")
                 .putString(FileDownloadWorker.KEY_FILE_NAME, "tokenizer.model")
                 .putString(FileDownloadWorker.KEY_MODEL_ID, "tokenizer")
+                .putString(FileDownloadWorker.KEY_MODEL_VERSION, "2.0.0")
                 .build()
             val workRequest = OneTimeWorkRequestBuilder<FileDownloadWorker>()
                 .setInputData(inputData)
                 .setExpedited(OutOfQuotaPolicy.DROP_WORK_REQUEST)
                 .build()
 
-            WorkManager.getInstance(applicationContext).enqueue(workRequest)
-
+            WorkManager.getInstance(applicationContext).enqueueUniqueWork(
+                "download_siglip2_tokenizer",
+                androidx.work.ExistingWorkPolicy.KEEP,
+                workRequest
+            )
         }
 
         val currentTheme = themes[userRepository.userInfo.customization_info.equippedTheme]!!
@@ -296,7 +300,7 @@ class MainActivity : FragmentActivity() {
                             ShowTutorial()
                         }
                         composable(RootRoute.ShowScreentimeStats.route) {
-                            ScreentimeStatsScreen()
+                            ScreentimeStatsScreen(navController)
                         }
                     }
 

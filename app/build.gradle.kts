@@ -6,7 +6,10 @@ plugins {
     kotlin("plugin.serialization") version "2.0.20"
     id("com.google.devtools.ksp")
     id("com.google.dagger.hilt.android")
-    id("com.google.gms.google-services")
+}
+
+if (file("google-services.json").exists()) {
+    apply(plugin = "com.google.gms.google-services")
 }
 
 android {
@@ -128,4 +131,7 @@ dependencies {
     implementation(project(":data"))
     implementation(project(":core"))
     implementation(project(":backend"))
+    implementation(project(":ai"))
+    implementation(libs.onnxruntime.android)
 }
+

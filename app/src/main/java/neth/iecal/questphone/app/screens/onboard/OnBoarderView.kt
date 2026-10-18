@@ -82,9 +82,27 @@ class OnboarderViewModel @Inject constructor(application: Application,
     private val _isNextEnabled = MutableStateFlow(true)
     val isNextEnabled: StateFlow<Boolean> = _isNextEnabled
 
+    val distractionAdderPrice: StateFlow<Int> = userRepository.distractionAdderPriceState
+    val distractionRemoverPrice: StateFlow<Int> = userRepository.distractionRemoverPriceState
+
     fun getDistractingApps(): Set<String> {
         return userRepository.getBlockedPackages()
     }
+
+    fun updateAdderPrice(price: Int) {
+        userRepository.updateDistractionToolPrices(
+            adderPrice = price.coerceIn(0, 10),
+            removerPrice = userRepository.getDistractionRemoverPrice()
+        )
+    }
+
+    fun updateRemoverPrice(price: Int) {
+        userRepository.updateDistractionToolPrices(
+            adderPrice = userRepository.getDistractionAdderPrice(),
+            removerPrice = price.coerceIn(20, 500)
+        )
+    }
+
     init {
         loadCurrentPage()
     }

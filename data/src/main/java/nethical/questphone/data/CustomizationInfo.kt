@@ -9,4 +9,7 @@ data class CustomizationInfo(
     var themeData: MutableMap<String, String> = mutableMapOf(),
 
     var purchasedWidgets: HashSet<String> = hashSetOf("Heat Map"),
-    var equippedWidget:String = "Heat Map", )
+    var equippedWidget:String = "Heat Map",
+    var distractionAdderPrice: Int = 0,
+    var distractionRemoverPrice: Int = 50,
+)

@@ -43,49 +43,66 @@ class FileDownloadWorker(
         .connectTimeout(2, TimeUnit.MINUTES)
         .readTimeout(5, TimeUnit.MINUTES)
         .writeTimeout(5, TimeUnit.MINUTES)
+        .followRedirects(true)
+        .followSslRedirects(true)
         .build()
 
-    // Single NotificationManager and Builder instance for efficiency
     private val notificationManager =
         applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
     private lateinit var notificationBuilder: NotificationCompat.Builder
     private var lastProgress = -1
 
     override suspend fun doWork(): Result {
-        // Extract input data; fail if essential data is missing.
         val url = inputData.getString(KEY_URL) ?: return Result.failure()
-        val fileName = inputData.getString(KEY_FILE_NAME) ?: "downloaded_file.zip"
+        val fileName = inputData.getString(KEY_FILE_NAME) ?: "downloaded_file.bin"
         val modelId = inputData.getString(KEY_MODEL_ID) ?: return Result.failure()
         val isOneShotModel = inputData.getBoolean(KEY_IS_ONE_SHOT, false)
-        val modelVersion = inputData.getString(KEY_MODEL_VERSION) ?: "0.0.0"
+        val modelVersion = inputData.getString(KEY_MODEL_VERSION)
+            ?: inputData.getString("model_version")
+            ?: "2.0.0"
 
         val notificationId = fileName.hashCode()
-        val file = File(applicationContext.filesDir, fileName)
+        val targetFile = File(applicationContext.filesDir, fileName)
+        val tempFile = File(applicationContext.filesDir, "$fileName.part")
 
         return try {
-            // CRITICAL FIX: Create channel and set foreground FIRST
             createNotificationChannel()
-            setForeground(createForegroundInfo(fileName, notificationId))
+            try {
+                setForeground(createForegroundInfo(fileName, notificationId))
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not promote download worker to foreground service: ${e.message}")
+            }
 
-            // Now proceed with the download
-            downloadFile(url, file, fileName, notificationId)
+            downloadFile(url, tempFile, fileName, notificationId)
+
+            if (!tempFile.exists() || tempFile.length() <= 0L) {
+                throw IllegalStateException("Downloaded file is empty: $fileName")
+            }
+
+            if (targetFile.exists()) {
+                targetFile.delete()
+            }
+            if (!tempFile.renameTo(targetFile)) {
+                tempFile.copyTo(targetFile, overwrite = true)
+                tempFile.delete()
+            }
 
             updateSharedPrefsOnSuccess(modelId, modelVersion, isOneShotModel)
             showSuccessNotification(fileName, notificationId)
-            Log.i(TAG, "Download successful for $fileName.")
+            Log.i(TAG, "Download successful for $fileName (${targetFile.length()} bytes).")
             Result.success()
 
         } catch (e: Exception) {
             Log.e(TAG, "Download failed permanently for $fileName.", e)
-            updateSharedPrefsOnFailure()
+            updateSharedPrefsOnFailure(modelId)
             showErrorNotification(fileName, notificationId, e.message ?: "An unknown error occurred")
-            file.delete() // IMPORTANT: Delete partial file on unrecoverable failure
+            tempFile.delete()
             Result.failure()
         }
     }
 
-    // CRITICAL FIX: Override getForegroundInfo for immediate foreground promotion
     override suspend fun getForegroundInfo(): ForegroundInfo {
+        createNotificationChannel()
         val fileName = inputData.getString(KEY_FILE_NAME) ?: "downloading..."
         val notificationId = fileName.hashCode()
         return createForegroundInfo(fileName, notificationId)
@@ -122,41 +139,51 @@ class FileDownloadWorker(
 
                 client.newCall(request.build()).execute().use { response ->
                     when (response.code) {
-                        // HTTP 416: Range Not Satisfiable. The file is already fully downloaded.
                         416 -> {
                             Log.i(TAG, "File $fileName already downloaded (Server returned 416).")
-                            return // Success
+                            return
                         }
-                        // HTTP 200 (OK) for new downloads, 206 (Partial Content) for resumed downloads.
                         200, 206 -> {
                             val body = response.body ?: throw IllegalStateException("Response body is null")
 
-                            // Dynamically determine the total file size from the response headers.
+                            // If server ignored Range header and returned 200, restart from byte 0
+                            val startOffset = if (response.code == 200) {
+                                if (downloadedBytes > 0L && file.exists()) {
+                                    file.delete()
+                                }
+                                0L
+                            } else {
+                                downloadedBytes
+                            }
+
                             val totalFileSize = if (response.code == 200) {
                                 body.contentLength()
                             } else {
                                 parseTotalSizeFromContentRange(response.header("Content-Range"))
                             }
 
-                            // A secondary check to see if the file is already complete.
-                            if (totalFileSize != -1L && downloadedBytes >= totalFileSize) {
+                            if (totalFileSize != -1L && startOffset >= totalFileSize) {
                                 Log.i(TAG, "File $fileName already downloaded (size check).")
-                                return // Success
+                                return
                             }
 
-                            // Write the downloaded bytes to the file.
-                            val finalSize = writeToFile(body.byteStream(), file, downloadedBytes, totalFileSize, fileName, notificationId)
+                            val finalSize = writeToFile(
+                                body.byteStream(),
+                                file,
+                                startOffset,
+                                totalFileSize,
+                                fileName,
+                                notificationId
+                            )
 
-                            // Final verification: ensure the downloaded file size matches the expected total size.
                             if (totalFileSize != -1L && finalSize != totalFileSize) {
                                 throw IllegalStateException("Download incomplete. Expected $totalFileSize, got $finalSize.")
                             }
 
                             Log.i(TAG, "Download stream finished successfully on attempt $attempt.")
-                            return // Success
+                            return
                         }
                         else -> {
-                            // Any other server response is treated as a temporary failure.
                             throw IllegalStateException("Server error: ${response.code} ${response.message}")
                         }
                     }
@@ -164,16 +191,13 @@ class FileDownloadWorker(
             } catch (e: Exception) {
                 Log.w(TAG, "Attempt $attempt to download $fileName failed.", e)
                 if (attempt == MAX_RETRIES) {
-                    throw e // Re-throw the last exception to fail the worker.
+                    throw e
                 }
-                delay(RETRY_DELAY_MS) // Wait before the next attempt.
+                delay(RETRY_DELAY_MS)
             }
         }
     }
 
-    /**
-     * Writes the input stream to a file at a specific offset, updating progress.
-     */
     private fun writeToFile(
         input: InputStream,
         file: File,
@@ -184,14 +208,13 @@ class FileDownloadWorker(
     ): Long {
         var totalRead = downloadedBytes
         RandomAccessFile(file, "rw").use { raf ->
-            raf.seek(downloadedBytes) // Move to the end of the partially downloaded file.
+            raf.seek(downloadedBytes)
             val buffer = ByteArray(DOWNLOAD_BUFFER_SIZE)
             var bytesRead: Int
             while (input.read(buffer).also { bytesRead = it } != -1) {
                 raf.write(buffer, 0, bytesRead)
                 totalRead += bytesRead
 
-                // Update notification progress, but not too frequently.
                 if (totalFileSize > 0) {
                     val progress = ((totalRead * 100) / totalFileSize).toInt().coerceIn(0, 100)
                     if (progress > lastProgress) {
@@ -204,9 +227,6 @@ class FileDownloadWorker(
         return totalRead
     }
 
-    /**
-     * Parses the total file size from a "Content-Range" header (e.g., "bytes 21010-47021/47022").
-     */
     private fun parseTotalSizeFromContentRange(contentRange: String?): Long {
         return contentRange?.substringAfter('/')?.toLongOrNull() ?: -1L
     }
@@ -222,7 +242,12 @@ class FileDownloadWorker(
             }
             putBoolean("is_downloaded_$modelId", true)
             putString("version_$modelId", version)
-            remove("downloading")
+            val currentDownloading = applicationContext
+                .getSharedPreferences("models", Context.MODE_PRIVATE)
+                .getString("downloading", null)
+            if (currentDownloading == null || currentDownloading == modelId) {
+                remove("downloading")
+            }
         }
         if (isOneShotModel) {
             applicationContext.getSharedPreferences("private_settings", Context.MODE_PRIVATE).edit()
@@ -231,18 +256,21 @@ class FileDownloadWorker(
         }
     }
 
-    private fun updateSharedPrefsOnFailure() {
-        applicationContext.getSharedPreferences("models", Context.MODE_PRIVATE).edit(commit = true) {
-            remove("downloading")
+    private fun updateSharedPrefsOnFailure(modelId: String) {
+        val sp = applicationContext.getSharedPreferences("models", Context.MODE_PRIVATE)
+        val currentDownloading = sp.getString("downloading", null)
+        if (currentDownloading == null || currentDownloading == modelId) {
+            sp.edit(commit = true) {
+                remove("downloading")
+            }
         }
     }
 
-    // --- Notification Management ---
     private fun createNotificationChannel() {
         val channel = NotificationChannel(
             NOTIFICATION_CHANNEL_ID,
             NOTIFICATION_CHANNEL_NAME,
-            NotificationManager.IMPORTANCE_LOW // Use LOW to be less intrusive for long-running tasks.
+            NotificationManager.IMPORTANCE_LOW
         ).apply {
             description = "Shows file download progress."
         }
@@ -250,16 +278,19 @@ class FileDownloadWorker(
     }
 
     private fun updateProgressNotification(fileName: String, notificationId: Int, progress: Int) {
+        if (!::notificationBuilder.isInitialized) {
+            createForegroundInfo(fileName, notificationId)
+        }
         notificationBuilder
             .setContentTitle("Downloading $fileName")
             .setContentText("$progress% complete")
-            .setProgress(100, progress, false) // Switch to determinate progress.
-            .setSilent(true) // Don't make a sound for each update.
+            .setProgress(100, progress, false)
+            .setSilent(true)
         notificationManager.notify(notificationId, notificationBuilder.build())
     }
 
     private fun showSuccessNotification(fileName: String, notificationId: Int) {
-        notificationManager.cancel(notificationId) // remove the ongoing download notification
+        notificationManager.cancel(notificationId)
         val successNotification = NotificationCompat.Builder(applicationContext, NOTIFICATION_CHANNEL_ID)
             .setSmallIcon(R.drawable.stat_sys_download_done)
             .setContentTitle("Download Complete")
@@ -267,7 +298,7 @@ class FileDownloadWorker(
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .setAutoCancel(true)
             .build()
-        notificationManager.notify(notificationId + 1, successNotification) // different ID so it doesn't get stuck
+        notificationManager.notify(notificationId + 1, successNotification)
     }
 
     private fun showErrorNotification(fileName: String, notificationId: Int, error: String) {
@@ -277,6 +308,7 @@ class FileDownloadWorker(
             .setStyle(NotificationCompat.BigTextStyle().bigText("Could not download $fileName: $error"))
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .setAutoCancel(true)
-        notificationManager.notify(notificationId, errorNotification.build())
+            .build()
+        notificationManager.notify(notificationId, errorNotification)
     }
 }

@@ -16,6 +16,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -37,11 +38,13 @@ import androidx.work.Data
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.OutOfQuotaPolicy
 import androidx.work.WorkManager
+import kotlinx.coroutines.delay
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 import neth.iecal.questphone.BuildConfig
 import neth.iecal.questphone.backed.fetchUrlContent
 import neth.iecal.questphone.core.workers.FileDownloadWorker
+import java.io.File
 
 @kotlinx.serialization.Serializable
 data class DownloadableModel(
@@ -51,8 +54,125 @@ data class DownloadableModel(
     val url: String,
     val version: String,
     val isRecommended: Boolean = false,
-    val isOnline:Boolean = false
+    val isOnline: Boolean = false
 )
+
+const val SIGLIP2_HF_BASE =
+    "https://huggingface.co/onnx-community/siglip2-base-patch16-224-ONNX/resolve/main"
+const val SIGLIP2_TOKENIZER_URL = "$SIGLIP2_HF_BASE/tokenizer.model"
+const val SIGLIP2_Q4_URL = "$SIGLIP2_HF_BASE/onnx/model_q4.onnx"
+const val SIGLIP2_INT8_URL = "$SIGLIP2_HF_BASE/onnx/model_int8.onnx"
+const val SIGLIP2_UINT8_URL = "$SIGLIP2_HF_BASE/onnx/model_uint8.onnx"
+const val SIGLIP2_FP16_URL = "$SIGLIP2_HF_BASE/onnx/model_fp16.onnx"
+
+val DEFAULT_SIGLIP2_MODELS = listOf(
+    DownloadableModel(
+        sizeMB = 0,
+        accuracy = "Very High (Cloud / Gemini API)",
+        id = "online",
+        url = "",
+        version = "2.0.0",
+        isRecommended = !BuildConfig.IS_FDROID,
+        isOnline = true
+    ),
+    DownloadableModel(
+        sizeMB = 252,
+        accuracy = "Good (Fast Q4 Quantized)",
+        id = "small",
+        url = SIGLIP2_Q4_URL,
+        version = "2.0.0",
+        isRecommended = BuildConfig.IS_FDROID,
+        isOnline = false
+    ),
+    DownloadableModel(
+        sizeMB = 380,
+        accuracy = "High (Balanced INT8 Quantized)",
+        id = "medium",
+        url = SIGLIP2_INT8_URL,
+        version = "2.0.0",
+        isRecommended = false,
+        isOnline = false
+    ),
+    DownloadableModel(
+        sizeMB = 382,
+        accuracy = "Very High (UINT8 Self-Contained)",
+        id = "full",
+        url = SIGLIP2_UINT8_URL,
+        version = "2.0.0",
+        isRecommended = false,
+        isOnline = false
+    )
+)
+
+/**
+ * Ensures any remote model entry points to a self-contained single-file quantized
+ * SigLIP 2 224x224 ONNX model and never uses the unquantized 1.5GB FP32 `model.onnx`
+ * (which requires external `model.onnx_data` and causes OOM crashes on Android).
+ */
+fun sanitizeDownloadableModel(model: DownloadableModel): DownloadableModel {
+    if (model.isOnline || model.id.equals("online", ignoreCase = true)) {
+        return model.copy(isOnline = true)
+    }
+    val lowerId = model.id.lowercase()
+    val lowerUrl = model.url.lowercase()
+
+    val isUnquantizedFp32 = lowerUrl.endsWith("/model.onnx") ||
+        lowerUrl.contains("model.onnx?") ||
+        lowerId.contains("fp32") ||
+        model.sizeMB > 1000
+    val isNonSiglip2 = !lowerUrl.contains("siglip2-base-patch16-224-onnx")
+
+    if (!isUnquantizedFp32 && !isNonSiglip2) {
+        return model
+    }
+
+    return when {
+        lowerId.contains("small") || lowerId.contains("q4") || lowerId.contains("tiny") -> model.copy(
+            url = SIGLIP2_Q4_URL,
+            sizeMB = if (model.sizeMB in 50..350) model.sizeMB else 252
+        )
+        lowerId.contains("medium") || lowerId.contains("int8") -> model.copy(
+            url = SIGLIP2_INT8_URL,
+            sizeMB = if (model.sizeMB in 200..500) model.sizeMB else 380
+        )
+        lowerId.contains("fp16") -> model.copy(
+            url = SIGLIP2_FP16_URL,
+            sizeMB = if (model.sizeMB in 500..900) model.sizeMB else 755
+        )
+        else -> model.copy(
+            url = SIGLIP2_UINT8_URL,
+            sizeMB = if (model.sizeMB in 250..600) model.sizeMB else 382
+        )
+    }
+}
+
+fun ensureTokenizerQueued(context: Context) {
+    val sp = context.getSharedPreferences("models", Context.MODE_PRIVATE)
+    val tokenizerFile = File(context.filesDir, "tokenizer.model")
+    val isTokenizerDownloaded = sp.getBoolean("is_downloaded_tokenizer", false) &&
+        tokenizerFile.exists() && tokenizerFile.length() > 1024L
+
+    if (!isTokenizerDownloaded) {
+        val inputData = Data.Builder()
+            .putString(FileDownloadWorker.KEY_URL, SIGLIP2_TOKENIZER_URL)
+            .putString(FileDownloadWorker.KEY_FILE_NAME, "tokenizer.model")
+            .putString(FileDownloadWorker.KEY_MODEL_ID, "tokenizer")
+            .putString(FileDownloadWorker.KEY_MODEL_VERSION, "2.0.0")
+            .putBoolean(FileDownloadWorker.KEY_IS_ONE_SHOT, false)
+            .build()
+
+        val workRequest = OneTimeWorkRequestBuilder<FileDownloadWorker>()
+            .setInputData(inputData)
+            .setExpedited(OutOfQuotaPolicy.DROP_WORK_REQUEST)
+            .build()
+
+        WorkManager.getInstance(context.applicationContext).enqueueUniqueWork(
+            "download_siglip2_tokenizer",
+            androidx.work.ExistingWorkPolicy.KEEP,
+            workRequest
+        )
+    }
+}
 
 @Composable
 fun ModelDownloadDialog(
@@ -63,60 +183,92 @@ fun ModelDownloadDialog(
     val sp = context.getSharedPreferences("models", Context.MODE_PRIVATE)
     var currentModel by remember { mutableStateOf<String?>(null) }
     var isModelDownloading by remember { mutableStateOf(sp.contains("downloading")) }
-    var modelStates by remember { mutableStateOf<List<MutableState<DownloadableModel>>>(emptyList()) }
+    var modelStates by remember {
+        mutableStateOf(DEFAULT_SIGLIP2_MODELS.map { mutableStateOf(it) })
+    }
+
+    // Keep download state synchronized while dialog is visible
+    LaunchedEffect(modelDownloadDialogVisible.value, isModelDownloading) {
+        while (modelDownloadDialogVisible.value && isModelDownloading) {
+            delay(1000L)
+            val stillDownloading = sp.contains("downloading")
+            if (!stillDownloading) {
+                isModelDownloading = false
+                currentModel = sp.getString("selected_one_shot_model", currentModel)
+            }
+        }
+    }
 
     LaunchedEffect(Unit) {
         currentModel = sp.getString("selected_one_shot_model", null)
 
-        if(currentModel==null && !BuildConfig.IS_FDROID) {
+        // Migrate any legacy unquantized FP32 selection to a safe quantized variant
+        if (currentModel != null && (currentModel == "model" || currentModel == "fp32" || currentModel == "full_fp32")) {
+            val migrated = "full"
+            sp.edit(commit = true) {
+                putString("selected_one_shot_model", migrated)
+            }
+            currentModel = migrated
+        }
+
+        if (currentModel == null && !BuildConfig.IS_FDROID) {
             currentModel = "online"
             sp.edit(commit = true) {
                 putString("selected_one_shot_model", "online")
             }
         }
-        if (currentModel == null) modelDownloadDialogVisible.value = true
+        if (currentModel == null) {
+            modelDownloadDialogVisible.value = true
+        }
 
-        val json = fetchUrlContent("https://raw.githubusercontent.com/QuestPhone/models/refs/heads/main/model_data.json")
-        try {
-            val parsed = Json.decodeFromString(
-                ListSerializer(DownloadableModel.serializer()), json!!
-            )
-            modelStates = parsed.map { mutableStateOf(it) }
+        val jsonStr = fetchUrlContent("https://raw.githubusercontent.com/QuestPhone/models/refs/heads/main/model_data.json")
+        if (!jsonStr.isNullOrBlank()) {
+            try {
+                val parsed = Json.decodeFromString(
+                    ListSerializer(DownloadableModel.serializer()),
+                    jsonStr
+                ).map { sanitizeDownloadableModel(it) }
 
-            // Check if any downloaded model has a version mismatch
-            for (modelState in modelStates) {
-                val model = modelState.value
-                val localVersion = sp.getString("version_${model.id}", null)
-                val isDownloaded = sp.getBoolean("is_downloaded_${model.id}", false)
-                if (isDownloaded && localVersion != model.version) {
-                    // Trigger re-download
-                    context.deleteFile("${model.id}.onnx")
-                    sp.edit {
-                        remove("is_downloaded_${model.id}")
-                        remove("version_${model.id}")
-                    }
-                    Toast.makeText(context, "Model ${model.id} is outdated. Re-downloading...", Toast.LENGTH_SHORT).show()
-
-                    sp.edit(commit = true) { putString("downloading", model.id) }
-                    isModelDownloading = true
-                    val inputData = Data.Builder()
-                        .putString("url", model.url)
-                        .putString("fileName", "${model.id}.onnx")
-                        .putString("model_id", model.id)
-                        .putString("model_version", model.version)
-                        .build()
-
-                    val downloadWork = OneTimeWorkRequestBuilder<FileDownloadWorker>()
-                        .setInputData(inputData)
-                        .build()
-
-                    WorkManager.getInstance(context).enqueue(downloadWork)
+                if (parsed.isNotEmpty()) {
+                    modelStates = parsed.map { mutableStateOf(it) }
                 }
-            }
 
-        } catch (e: Exception) {
-            Log.d("Failed to load model", e.message.toString())
-            Toast.makeText(context, "Failed to load model list", Toast.LENGTH_SHORT).show()
+                for (modelState in modelStates) {
+                    val model = modelState.value
+                    if (model.isOnline) continue
+                    val modelFile = File(context.filesDir, "${model.id}.onnx")
+                    val localVersion = sp.getString("version_${model.id}", null)
+                    val isDownloaded = sp.getBoolean("is_downloaded_${model.id}", false) && modelFile.exists()
+                    if (isDownloaded && localVersion != null && localVersion != model.version) {
+                        context.deleteFile("${model.id}.onnx")
+                        sp.edit {
+                            remove("is_downloaded_${model.id}")
+                            remove("version_${model.id}")
+                        }
+                        Toast.makeText(context, "Model ${model.id} updated. Re-downloading...", Toast.LENGTH_SHORT).show()
+
+                        sp.edit(commit = true) { putString("downloading", model.id) }
+                        isModelDownloading = true
+                        ensureTokenizerQueued(context)
+
+                        val inputData = Data.Builder()
+                            .putString(FileDownloadWorker.KEY_URL, model.url)
+                            .putString(FileDownloadWorker.KEY_FILE_NAME, "${model.id}.onnx")
+                            .putString(FileDownloadWorker.KEY_MODEL_ID, model.id)
+                            .putString(FileDownloadWorker.KEY_MODEL_VERSION, model.version)
+                            .putBoolean(FileDownloadWorker.KEY_IS_ONE_SHOT, true)
+                            .build()
+
+                        val downloadWork = OneTimeWorkRequestBuilder<FileDownloadWorker>()
+                            .setInputData(inputData)
+                            .build()
+
+                        WorkManager.getInstance(context).enqueue(downloadWork)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w("ModelDownloadDialog", "Using built-in SigLIP 2 model catalog: ${e.message}")
+            }
         }
     }
 
@@ -133,33 +285,51 @@ fun ModelDownloadDialog(
                 shape = RoundedCornerShape(16.dp),
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
                 elevation = CardDefaults.cardElevation(defaultElevation = 8.dp),
-                modifier = Modifier.fillMaxWidth().padding(16.dp)
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp)
             ) {
                 Column(modifier = Modifier.padding(24.dp)) {
-                    Text("Download Model", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.padding(bottom = 8.dp))
                     Text(
-                        "Hey F-Droid users! Offline AISNAP quests don’t work here properly. Please use online mode for now (download the app from playstore), and if you know how to help us fix this, we’d love your support! I'm new to ai/ml and it would be great if you could help fine tune a model.",
+                        "Select AI Verification Model",
+                        style = MaterialTheme.typography.headlineSmall,
+                        modifier = Modifier.padding(bottom = 8.dp)
+                    )
+                    Text(
+                        "Choose an offline on-device SigLIP 2 vision model (quantized for fast mobile inference) or online verification.",
                         style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(bottom = 20.dp)
                     )
                     if (isModelDownloading) {
-                        Text(
-                            "Please wait while the model downloads.",
-                            style = MaterialTheme.typography.bodyMedium,
-                            textAlign = TextAlign.Center,
-                            modifier = Modifier.padding(bottom = 12.dp)
-                        )
-                    } else {
-                        if(modelStates.isEmpty()){
-                            Text("Loading Available Models")
+                        val downloadingId = sp.getString("downloading", "model") ?: "model"
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 12.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Text(
+                                "Downloading $downloadingId model in background...\nCheck notifications for live progress.",
+                                style = MaterialTheme.typography.bodyMedium,
+                                textAlign = TextAlign.Center
+                            )
                         }
-                        LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.weight(1f, false)) {
+                    } else {
+                        LazyColumn(
+                            verticalArrangement = Arrangement.spacedBy(12.dp),
+                            modifier = Modifier.weight(1f, false)
+                        ) {
                             items(modelStates) { modelState ->
                                 val model = modelState.value
-                                val isDownloaded = sp.getBoolean("is_downloaded_${model.id}", false) || model.isOnline
+                                val modelFile = File(context.filesDir, "${model.id}.onnx")
+                                val isDownloaded = model.isOnline ||
+                                    (sp.getBoolean("is_downloaded_${model.id}", false) && modelFile.exists() && modelFile.length() > 1024L)
                                 val localVersion = sp.getString("version_${model.id}", null)
                                 val isSelected = currentModel == model.id
-                                val needsUpdate = (localVersion != model.version && isDownloaded)
+                                val needsUpdate = !model.isOnline && isDownloaded && localVersion != null && localVersion != model.version
 
                                 Card(
                                     shape = RoundedCornerShape(12.dp),
@@ -174,7 +344,7 @@ fun ModelDownloadDialog(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .clickable(enabled = !isModelDownloading) {
-                                            if ((isDownloaded && !needsUpdate)|| model.isOnline ) {
+                                            if ((isDownloaded && !needsUpdate) || model.isOnline) {
                                                 sp.edit(commit = true) {
                                                     putString("selected_one_shot_model", model.id)
                                                 }
@@ -185,8 +355,16 @@ fun ModelDownloadDialog(
                                                     "validation_engine",
                                                     if (model.isOnline) "cloud" else "local"
                                                 ).apply()
-                                                Toast.makeText(context, "AI engine switched to ${if (model.isOnline) "Cloud Server" else "Local AI"}", Toast.LENGTH_SHORT).show()
+                                                if (!model.isOnline) {
+                                                    ensureTokenizerQueued(context)
+                                                }
+                                                Toast.makeText(
+                                                    context,
+                                                    "AI engine switched to ${if (model.isOnline) "Cloud Server" else "Local AI (${model.id})"}",
+                                                    Toast.LENGTH_SHORT
+                                                ).show()
                                             } else {
+                                                ensureTokenizerQueued(context)
                                                 sp.edit(commit = true) {
                                                     putString("downloading", model.id)
                                                 }
@@ -207,7 +385,7 @@ fun ModelDownloadDialog(
 
                                                 WorkManager.getInstance(context).enqueue(workRequest)
 
-                                                Toast.makeText(context, "Download Started", Toast.LENGTH_SHORT).show()
+                                                Toast.makeText(context, "Download Started for ${model.id}", Toast.LENGTH_SHORT).show()
                                             }
                                         }
                                 ) {
@@ -219,7 +397,11 @@ fun ModelDownloadDialog(
                                         ) {
                                             Column(modifier = Modifier.weight(1f)) {
                                                 if (model.isRecommended) {
-                                                    Text("Recommended", style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.primary)
+                                                    Text(
+                                                        "Recommended",
+                                                        style = MaterialTheme.typography.labelMedium,
+                                                        color = MaterialTheme.colorScheme.primary
+                                                    )
                                                 }
                                                 Text(
                                                     model.id,
@@ -238,9 +420,9 @@ fun ModelDownloadDialog(
                                                 )
                                                 Text(
                                                     text = if (model.isOnline) {
-                                                        "Requires online access and your private Gemini API Key. Best validation accuracy."
+                                                        "Requires internet connection (Cloud Server or Gemini API Key)."
                                                     } else {
-                                                        "Completely offline. Uses a small local model (~15MB), which has lower accuracy."
+                                                        "100% offline on-device SigLIP 2 ONNX model (~${model.sizeMB} MB)."
                                                     },
                                                     style = MaterialTheme.typography.labelSmall,
                                                     color = if (isSelected)
@@ -258,13 +440,16 @@ fun ModelDownloadDialog(
                                             }
 
                                             Column(horizontalAlignment = Alignment.End) {
-                                                if (isDownloaded) {
+                                                if (isDownloaded && !model.isOnline) {
                                                     TextButton(
                                                         onClick = {
                                                             context.deleteFile("${model.id}.onnx")
-                                                            sp.edit {
+                                                            sp.edit(commit = true) {
                                                                 remove("is_downloaded_${model.id}")
                                                                 remove("version_${model.id}")
+                                                            }
+                                                            if (currentModel == model.id) {
+                                                                currentModel = null
                                                             }
                                                             Toast.makeText(context, "Model deleted", Toast.LENGTH_SHORT).show()
                                                         },
@@ -272,9 +457,9 @@ fun ModelDownloadDialog(
                                                     ) {
                                                         Text("Delete", style = MaterialTheme.typography.labelSmall)
                                                     }
-                                                }else {
+                                                } else if (!model.isOnline) {
                                                     Text(
-                                                        "${model.sizeMB}mb",
+                                                        "${model.sizeMB} MB",
                                                         style = MaterialTheme.typography.bodySmall,
                                                         color = if (isSelected)
                                                             MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f)

@@ -78,6 +78,9 @@ class StoreViewModel @Inject constructor(
     private val userRepository: UserRepository
 ): ViewModel() {
     var coins = userRepository.coinsState
+    val distractionAdderPrice = userRepository.distractionAdderPriceState
+    val distractionRemoverPrice = userRepository.distractionRemoverPriceState
+    val inventoryState = userRepository.inventoryState
 
     var selectedStoreCategory by mutableStateOf<StoreCategory>(StoreCategory.TOOLS)
         private set
@@ -93,12 +96,33 @@ class StoreViewModel @Inject constructor(
 
     var homeWidgetList by mutableStateOf(homeWidgets.toList().filter { !userRepository.userInfo.customization_info.purchasedWidgets.contains(it.first) })
 
+    fun getItemPrice(item: InventoryItem): Int {
+        return userRepository.getEffectivePrice(item)
+    }
+
+    fun getItemDescription(item: InventoryItem): String {
+        val price = getItemPrice(item)
+        return when (item) {
+            InventoryItem.DISTRACTION_ADDER -> {
+                if (price == 0) {
+                    "Add apps to the distraction blocklist (Configured: Free / 0 coins)"
+                } else {
+                    "Add apps to the distraction blocklist (Configured cost: $price coins)"
+                }
+            }
+            InventoryItem.DISTRACTION_REMOVER -> {
+                "Remove an app from the distractions blocklist (Configured commitment cost: $price coins)"
+            }
+            else -> item.description
+        }
+    }
+
     fun hasEnoughCoins(price:Int): Boolean {
         val userCoins = userRepository.userInfo.coins
         return userCoins >= price
     }
     fun hasEnoughCoinsToPurchaseItem(item: InventoryItem): Boolean {
-        return hasEnoughCoins(item.price)
+        return hasEnoughCoins(getItemPrice(item))
     }
 
     fun hasEnoughCoinsToPurchaseItem(item: BaseTheme): Boolean {
@@ -118,11 +142,15 @@ class StoreViewModel @Inject constructor(
     }
 
     fun makeItemPurchase(item: InventoryItem): Boolean {
-        var itemMap = hashMapOf<InventoryItem, Int>()
-        itemMap.put(item,1)
+        val price = getItemPrice(item)
+        if (!hasEnoughCoins(price)) return false
+        val itemMap = hashMapOf<InventoryItem, Int>()
+        itemMap[item] = 1
 
         userRepository.addItemsToInventory(itemMap)
-        userRepository.useCoins(item.price)
+        if (price > 0) {
+            userRepository.useCoins(price)
+        }
         return true
     }
 
@@ -152,6 +180,11 @@ fun StoreScreen(
     var showSuccessMessage by remember { mutableStateOf<Triple<String, String, ()-> Unit>?>(null) }
     val snackbarHostState = remember { SnackbarHostState() }
     val coins by viewModel.coins.collectAsState()
+    val adderPrice by viewModel.distractionAdderPrice.collectAsState()
+    val removerPrice by viewModel.distractionRemoverPrice.collectAsState()
+    val inventoryMap by viewModel.inventoryState.collectAsState()
+    // Keep reference to live prices so Store recomposes when prices or inventory change
+    val _liveSync = adderPrice + removerPrice + inventoryMap.size
     // auto dismiss message
     showSuccessMessage?.let { message ->
         LaunchedEffect(message) {
@@ -234,12 +267,13 @@ fun StoreScreen(
 
                     else -> {
                         items(viewModel.getItemsByCategory(viewModel.selectedStoreCategory)) { item ->
+                            val dynamicPrice = viewModel.getItemPrice(item)
                             StoreItemCard(
                                 onClick = { selectedInventoryItem = item },
                                 title = item.simpleName,
-                                description = item.description,
+                                description = viewModel.getItemDescription(item),
                                 icon = item.icon,
-                                price = item.price,
+                                price = dynamicPrice,
                             )
                         }
                     }
@@ -249,10 +283,11 @@ fun StoreScreen(
 
             // Purchase dialog
             selectedInventoryItem?.let { item ->
+                val dynamicPrice = viewModel.getItemPrice(item)
                 PurchaseDialog(
                     hasEnoughCoins = viewModel.hasEnoughCoinsToPurchaseItem(item),
                     userCoins = coins,
-                    inventoryCount = viewModel.getItemInventoryCount(selectedInventoryItem!!),
+                    inventoryCount = viewModel.getItemInventoryCount(item),
                     onDismiss = { selectedInventoryItem = null },
                     onPurchase = {
                         if (viewModel.makeItemPurchase(item)) {
@@ -263,8 +298,8 @@ fun StoreScreen(
                         }
                     },
                     title = item.simpleName,
-                    description = item.description,
-                    price = item.price,
+                    description = viewModel.getItemDescription(item),
+                    price = dynamicPrice,
                     center = {
                         Box(
                             modifier = Modifier

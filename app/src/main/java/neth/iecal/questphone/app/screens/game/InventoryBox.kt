@@ -65,6 +65,7 @@ class InventoryBoxViewModel @Inject constructor(
 ): ViewModel(){
     val userInfo = userRepository.userInfo
     val activeBoosts = userRepository.activeBoostsState
+    val inventoryState = userRepository.inventoryState
 
     private var _selectedInventoryItem = MutableStateFlow<InventoryItem?>(null)
     val selectedInventoryItem: StateFlow<InventoryItem?> = _selectedInventoryItem.asStateFlow()
@@ -74,15 +75,15 @@ class InventoryBoxViewModel @Inject constructor(
     }
 
     fun useSelectedItem(navController: NavController){
-        executeItem( selectedInventoryItem.value!!, InventoryExecParams(
+        val itemToUse = selectedInventoryItem.value ?: return
+        userRepository.deductFromInventory(itemToUse)
+        _selectedInventoryItem.value = null
+        executeItem(itemToUse, InventoryExecParams(
             navController = navController,
             userRepository = userRepository,
             questRepository = questRepository,
             statsRepository = statsRepository
         ))
-
-        userRepository.deductFromInventory(selectedInventoryItem.value!!)
-        _selectedInventoryItem.value = null
     }
     fun selectedItem(item: InventoryItem?){
         _selectedInventoryItem.value = item
@@ -93,6 +94,7 @@ class InventoryBoxViewModel @Inject constructor(
 fun InventoryBox(navController: NavController,viewModel: InventoryBoxViewModel = hiltViewModel()) {
     val selectedInventoryItem by viewModel.selectedInventoryItem.collectAsState()
     val activeBoosts by viewModel.activeBoosts.collectAsState()
+    val inventoryMap by viewModel.inventoryState.collectAsState()
 
 
     if (selectedInventoryItem != null) {
@@ -133,9 +135,11 @@ fun InventoryBox(navController: NavController,viewModel: InventoryBoxViewModel =
     Column(
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        viewModel.userInfo.inventory.forEach { it ->
-            InventoryItemCard(it.key, it.value) { item ->
-                viewModel.selectedItem(item)
+        inventoryMap.forEach { (item, count) ->
+            if (count > 0) {
+                InventoryItemCard(item, count) { clicked ->
+                    viewModel.selectedItem(clicked)
+                }
             }
         }
         Spacer(Modifier.size(1.dp).padding(
